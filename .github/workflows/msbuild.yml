@@ -1,0 +1,60 @@
+name: MSBuild
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  SOLUTION_FILE_PATH: ./yubx.sln
+  BUILD_CONFIGURATION: Release
+  PLATFORM: x64
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1.0.2
+
+    - name: Restore NuGet packages
+      run: nuget restore ${{ env.SOLUTION_FILE_PATH }}
+
+    - name: Build solution
+      run: msbuild ${{ env.SOLUTION_FILE_PATH }} /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=${{ env.PLATFORM }}
+
+    - name: Find built executable
+      id: find_exe
+      shell: pwsh
+      run: |
+        $exe = Get-ChildItem -Path . -Recurse -Filter Injector.exe | Where-Object { $_.FullName -match "\\x64\\Release\\" } | Select-Object -First 1
+        if (-not $exe) {
+          Write-Error "Injector.exe not found in expected build output."
+          exit 1
+        }
+        $relativePath = $exe.FullName.Substring("${{ github.workspace }}".Length + 1) -replace '\\', '/'
+        echo "EXE_PATH=$relativePath" >> $env:GITHUB_ENV
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: build-${{ github.run_number }}
+        name: Injector Build v${{ github.run_number }}
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload Injector.exe to release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ github.run_number }}
+        name: Injector-${{ github.run_number }}.exe
+        files: ${{ env.EXE_PATH }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
