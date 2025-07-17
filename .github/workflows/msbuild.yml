@@ -1,0 +1,143 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: true
+
+env:
+  SOLUTION_FILE_PATH: ./yubx.sln
+  BUILD_CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  check_recent_commit:
+    runs-on: windows-latest
+    name: Check Recent Commit
+    outputs:
+      should_run: ${{ steps.should_run.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: should_run
+        run: |
+          $changed = git rev-list --since="24 hours ago" --all
+          if ($changed) {
+            echo "should_run=true" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "should_run=false" >> $env:GITHUB_OUTPUT
+          }
+
+  build_nightly:
+    runs-on: windows-latest
+    name: Build Nightly
+    needs: check_recent_commit
+    if: needs.check_recent_commit.outputs.should_run == 'true'
+    outputs:
+      full_sha: ${{ steps.var.outputs.full_sha }}
+      short_sha: ${{ steps.var.outputs.short_sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.0.2
+
+      - name: Restore NuGet packages
+        run: nuget restore $env:SOLUTION_FILE_PATH
+
+      - name: Build solution
+        run: msbuild $env:SOLUTION_FILE_PATH /p:Configuration=$env:BUILD_CONFIGURATION /p:Platform=$env:PLATFORM
+
+      - name: Find built executable
+        id: find_exe
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path . -Recurse -Filter Injector.exe | Where-Object { $_.FullName -match "\\x64\\Release\\" } | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Injector.exe not found in expected output."
+            exit 1
+          }
+          echo "exe_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary
+          path: ${{ steps.find_exe.outputs.exe_path }}
+
+      - name: Generate Build Info
+        id: var
+        shell: pwsh
+        run: |
+          echo "full_sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+  recreate_release:
+    runs-on: windows-latest
+    name: Recreate Release
+    needs: build_nightly
+    if: needs.check_recent_commit.outputs.should_run == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Delete Existing Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = "nightly";
+
+            const releases = await github.rest.repos.listReleases({ owner, repo });
+            const release = releases.data.find(r => r.tag_name === tag);
+
+            if (release) {
+              await github.rest.repos.deleteRelease({ owner, repo, release_id: release.id });
+              console.log(`Deleted release with ID ${release.id}`);
+            } else {
+              console.log("No existing release to delete");
+            }
+
+            try {
+              await github.rest.git.deleteRef({ owner, repo, ref: `tags/${tag}` });
+              console.log(`Deleted tag ${tag}`);
+            } catch (error) {
+              console.error(`Error deleting tag: ${error.message}`);
+            }
+
+      - name: Download Built Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: binary
+
+      - name: Generate SHA256
+        id: build_sha
+        run: |
+          certutil -hashfile Injector.exe SHA256 > checksum.txt
+          $hash = Get-Content checksum.txt | Select-String -Pattern "^[A-F0-9]{64}$" | Select-Object -First 1
+          echo "build_sha=$($hash.Line)" >> $env:GITHUB_OUTPUT
+
+      - name: Publish Nightly Release
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          name: Nightly [${{ needs.build_nightly.outputs.short_sha }}]
+          tag_name: nightly
+          body: |
+            **Nightly Build** - Automatically published
+            [GitHub Actions Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            SHA256 Checksum:
+            ```
+            ${{ steps.build_sha.outputs.build_sha }}
+            ```
+
+            Full Commit:
+            ```
+            ${{ needs.build_nightly.outputs.full_sha }}
+            ```
+          files: Injector.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
